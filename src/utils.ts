@@ -20,21 +20,48 @@ import { useEffect, useRef } from "react";
 
 export const EMPTY_ID = 2289754288;
 
-const GAME_2_CHARACTER_TYPES = new Set(["Pl2400", "Pl2500", "Pl2600", "Pl2700", "Pl2800", "Pl2900"]);
+// Game 2.0 actions do not share one numeric layout. Keep only aliases that are
+// confirmed by the official action tables instead of rounding arbitrary IDs to
+// the nearest hundred (which mislabels normal attacks as equipped abilities).
+const GAME_2_SKILL_ALIASES: Readonly<Record<string, Readonly<Record<number, number>>>> = {
+  Pl2400: {
+    1410: 1400,
+  },
+  Pl2500: {
+    1101: 1100,
+    1401: 1400,
+  },
+  Pl2700: {
+    1001: 1000,
+    1010: 1000,
+    1011: 1000,
+    1110: 1100,
+    1120: 1100,
+    1310: 1300,
+    1601: 1600,
+    1602: 1600,
+  },
+  Pl2800: {
+    5010: 5000,
+    6001: 6000,
+    6002: 6000,
+  },
+  Pl2900: {
+    2010: 2000,
+    2020: 2000,
+    8010: 8000,
+    8020: 8000,
+    8030: 8000,
+  },
+};
 
 export const getSkillTranslationKeys = (characterType: CharacterType, skillID: number) => {
   if (typeof characterType !== "string") return [];
 
   const keys = [`skills.${characterType}.${skillID}`];
 
-  // Damage variants often add a small suffix to the equipped ability's base ID
-  // (for example, 1510 is a projectile spawned by ability 1500). The six 2.0
-  // characters use the same 1000..1800 ability slots, so fall back to the slot
-  // name when a variant has no dedicated translation.
-  if (GAME_2_CHARACTER_TYPES.has(characterType) && skillID >= 1000 && skillID < 1900) {
-    const abilitySlotID = Math.floor(skillID / 100) * 100;
-    if (abilitySlotID !== skillID) keys.push(`skills.${characterType}.${abilitySlotID}`);
-  }
+  const baseSkillID = GAME_2_SKILL_ALIASES[characterType]?.[skillID];
+  if (baseSkillID !== undefined && baseSkillID !== skillID) keys.push(`skills.${characterType}.${baseSkillID}`);
 
   return keys;
 };

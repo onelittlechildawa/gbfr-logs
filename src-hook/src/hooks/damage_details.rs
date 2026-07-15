@@ -237,24 +237,21 @@ fn build_damage_details(probe: &DamageProbe, after: RawDamageFields) -> DamageDe
     let attack_call = probe.attacks.first();
     let defense_call = probe.defenses.first();
 
-    let mut statuses = Vec::new();
-    if let Some(call) = attack_call {
-        statuses.extend(call.statuses.iter().cloned());
-    }
-    if let Some(call) = defense_call {
-        statuses.extend(call.statuses.iter().cloned());
-    }
+    let statuses = merge_damage_statuses(
+        attack_call.map_or(&[], |call| call.statuses.as_slice()),
+        defense_call.map_or(&[], |call| call.statuses.as_slice()),
+    );
 
-    let attack_multiplier = 1.0
-        + statuses
-            .iter()
-            .filter(|status| status.interface == StatusInterface::Attack)
-            .map(|status| status.value)
-            .sum::<f32>();
+    let attack_multiplier = attack_only_multiplier(&statuses);
     let amplify_multiplier = 1.0
         + statuses
             .iter()
-            .filter(|status| status.interface == StatusInterface::Amplify)
+            .filter(|status| status.interface == StatusInterface::Amplify && status.category == 0)
+            .map(|status| status.value)
+            .sum::<f32>()
+        - statuses
+            .iter()
+            .filter(|status| status.interface == StatusInterface::Amplify && status.category == 1)
             .map(|status| status.value)
             .sum::<f32>();
     let damage_limit_multiplier = 1.0
@@ -264,19 +261,21 @@ fn build_damage_details(probe: &DamageProbe, after: RawDamageFields) -> DamageDe
             .map(|status| status.value)
             .sum::<f32>();
 
-    let defense_multiplier = defense_call
-        .map(|call| effective_defense_multiplier(call.buckets))
+    // AttackMultiplier already contains the complete native attack/defense
+    // aggregation, including cross-bucket multiplication and local clamps.
+    let defense_multiplier = attack_call
+        .map(|call| finite_or_default(call.result, 1.0))
         .unwrap_or(1.0);
-    let elemental_multiplier = valid_multiplier(after.elemental_multiplier).unwrap_or(1.0);
-    let supplementary_multiplier = valid_supplementary_ratio(after.candidate_154)
-        .map(|ratio| 1.0 + ratio)
-        .unwrap_or(1.0);
+    // +0x2D8 is critical-hit probability. Keep the historical wire field name
+    // so this correction does not increase or invalidate persisted hit data.
+    let elemental_multiplier = finite_or_default(after.elemental_multiplier, 0.0);
+    // Pursuit is emitted as a separate damage event and must not multiply each
+    // originating hit merely because +0x154 contains a candidate ratio.
+    let supplementary_multiplier = 1.0;
     let formula_multiplier = calculate_formula_multiplier(
-        elemental_multiplier,
+        damage_limit_multiplier,
         amplify_multiplier,
         defense_multiplier,
-        attack_multiplier,
-        supplementary_multiplier,
     );
 
     DamageDetails {
@@ -287,51 +286,93 @@ fn build_damage_details(probe: &DamageProbe, after: RawDamageFields) -> DamageDe
         supplementary_multiplier,
         formula_multiplier,
         attack_rate: finite_or_default(after.candidate_d8, 0.0),
-        uncapped_damage: finite_or_default(after.uncapped_damage, 0.0),
+        // Store the normalization base rather than adding another per-hit
+        // field. Old logs remain readable and are clamped again by the parser.
+        uncapped_damage: clamped_base_damage(after),
         damage_cap: after.damage_cap,
         damage_limit_multiplier,
-        statuses: statuses
-            .into_iter()
-            .map(|status| DamageStatusContribution {
-                status_name: status.class_name,
-                kind: match status.interface {
-                    StatusInterface::Attack => DamageModifierKind::Attack,
-                    StatusInterface::Defense => DamageModifierKind::Defense,
-                    StatusInterface::DamageLimit => DamageModifierKind::DamageLimit,
-                    StatusInterface::BonusAttack => DamageModifierKind::BonusAttack,
-                    StatusInterface::Amplify => DamageModifierKind::Amplify,
-                },
-                category: status.category,
-                value: status.value,
-            })
-            .collect(),
+        statuses: grouped_protocol_statuses(statuses),
     }
 }
 
-fn calculate_formula_multiplier(
-    elemental: f32,
-    amplify: f32,
-    defense: f32,
-    attack: f32,
-    supplementary: f32,
-) -> f32 {
-    (elemental * amplify + (defense * attack - 1.0) / 2.0) * supplementary
+fn calculate_formula_multiplier(damage_limit: f32, amplify: f32, attack_defense: f32) -> f32 {
+    damage_limit * amplify + (attack_defense - 1.0).max(0.0) * 0.5
 }
 
-fn effective_defense_multiplier(buckets: [f32; 7]) -> f32 {
-    let multiplier = (1.0 + buckets[0])
-        * (1.0 - buckets[1])
-        * (1.0 - buckets[2])
-        * (1.0 + buckets[3] + buckets[4] - buckets[5] - buckets[6]);
-    valid_multiplier(multiplier).unwrap_or(1.0)
+fn attack_only_multiplier(statuses: &[StatusContributionProbe]) -> f32 {
+    let mut buckets = [0.0f32; 5];
+    for status in statuses
+        .iter()
+        .filter(|status| status.interface == StatusInterface::Attack)
+    {
+        if let Some(bucket) = buckets.get_mut(status.category as usize) {
+            *bucket += status.value;
+        }
+    }
+
+    let positive = 1.0 + buckets[0] + buckets[1];
+    let negative = (1.0 - buckets[3] - buckets[4]).max(0.0);
+    finite_or_default(negative * (buckets[2] + positive), 1.0)
 }
 
-fn valid_multiplier(value: f32) -> Option<f32> {
-    (value.is_finite() && value > 0.0 && value <= 20.0).then_some(value)
+fn clamped_base_damage(after: RawDamageFields) -> f32 {
+    let mut damage = finite_or_default(after.uncapped_damage, 0.0).max(0.0);
+    if after.candidate_2b8 > 0 {
+        damage = damage.max(after.candidate_2b8 as f32);
+    }
+    if after.damage_cap > 0 {
+        damage = damage.min(after.damage_cap as f32);
+    }
+    damage
 }
 
-fn valid_supplementary_ratio(value: f32) -> Option<f32> {
-    (value.is_finite() && (0.0..=10.0).contains(&value)).then_some(value)
+fn grouped_protocol_statuses(
+    statuses: Vec<StatusContributionProbe>,
+) -> Vec<DamageStatusContribution> {
+    let mut grouped: Vec<DamageStatusContribution> = Vec::new();
+
+    for status in statuses {
+        let kind = match status.interface {
+            StatusInterface::Attack => DamageModifierKind::Attack,
+            StatusInterface::Defense => DamageModifierKind::Defense,
+            StatusInterface::DamageLimit => DamageModifierKind::DamageLimit,
+            StatusInterface::BonusAttack => DamageModifierKind::BonusAttack,
+            StatusInterface::Amplify => DamageModifierKind::Amplify,
+        };
+
+        if let Some(existing) = grouped.iter_mut().find(|existing| {
+            existing.status_name == status.class_name
+                && existing.kind == kind
+                && existing.category == status.category
+        }) {
+            existing.value += status.value;
+        } else {
+            grouped.push(DamageStatusContribution {
+                status_name: status.class_name,
+                kind,
+                category: status.category,
+                value: status.value,
+            });
+        }
+    }
+
+    grouped
+}
+
+fn merge_damage_statuses(
+    attacker_statuses: &[StatusContributionProbe],
+    target_defense_statuses: &[StatusContributionProbe],
+) -> Vec<StatusContributionProbe> {
+    let mut statuses = attacker_statuses
+        .iter()
+        // The attack aggregation receives the attacker's status manager and
+        // therefore exposes self-defense effects such as Guard Enmity's
+        // StatusDeffenceBuff. They do not participate in outgoing damage CD.
+        .filter(|status| status.interface != StatusInterface::Defense)
+        .cloned()
+        .collect::<Vec<_>>();
+    statuses.extend(target_defense_statuses.iter().cloned());
+    statuses
 }
 
 fn finite_or_default(value: f32, default: f32) -> f32 {
@@ -605,18 +646,81 @@ fn read_raw_fields(instance: *const usize) -> RawDamageFields {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_formula_multiplier, effective_defense_multiplier};
+    use super::{
+        calculate_formula_multiplier, clamped_base_damage, grouped_protocol_statuses,
+        merge_damage_statuses, RawDamageFields, StatusContributionProbe, StatusInterface,
+    };
 
     #[test]
-    fn defense_buckets_match_observed_additive_debuffs() {
-        let mut buckets = [0.0; 7];
-        buckets[4] = 0.65;
-        assert!((effective_defense_multiplier(buckets) - 1.65).abs() < f32::EPSILON);
+    fn effective_formula_uses_native_attack_defense_result() {
+        let result = calculate_formula_multiplier(1.3, 0.6, 1.23);
+        assert!((result - 0.895).abs() < 0.0001);
     }
 
     #[test]
-    fn requested_damage_formula_is_applied_in_order() {
-        let result = calculate_formula_multiplier(1.2, 1.15, 1.65, 1.2, 1.8);
-        assert!((result - 3.366).abs() < 0.0001);
+    fn clamped_base_applies_floor_then_cap() {
+        let fields = RawDamageFields {
+            uncapped_damage: 80.0,
+            candidate_2b8: 100,
+            damage_cap: 90,
+            ..RawDamageFields::default()
+        };
+
+        assert_eq!(clamped_base_damage(fields), 90.0);
+    }
+
+    #[test]
+    fn duplicate_statuses_are_compacted_before_persisting() {
+        let statuses = vec![
+            StatusContributionProbe {
+                class_name: "StatusAttackBuff".to_string(),
+                interface: StatusInterface::Attack,
+                category: 0,
+                value: 0.1,
+            },
+            StatusContributionProbe {
+                class_name: "StatusAttackBuff".to_string(),
+                interface: StatusInterface::Attack,
+                category: 0,
+                value: 0.13,
+            },
+        ];
+
+        let compacted = grouped_protocol_statuses(statuses);
+        assert_eq!(compacted.len(), 1);
+        assert!((compacted[0].value - 0.23).abs() < 0.0001);
+    }
+
+    #[test]
+    fn attacker_defense_statuses_are_not_persisted_as_damage_effects() {
+        let attacker_statuses = vec![
+            StatusContributionProbe {
+                class_name: "StatusAttackBuff".to_string(),
+                interface: StatusInterface::Attack,
+                category: 0,
+                value: 0.43,
+            },
+            StatusContributionProbe {
+                class_name: "StatusDeffenceBuff".to_string(),
+                interface: StatusInterface::Defense,
+                category: 0,
+                value: 0.18,
+            },
+        ];
+        let target_statuses = vec![StatusContributionProbe {
+            class_name: "StatusDeffenceDebuff".to_string(),
+            interface: StatusInterface::Defense,
+            category: 4,
+            value: 0.15,
+        }];
+
+        let merged = merge_damage_statuses(&attacker_statuses, &target_statuses);
+        assert_eq!(merged.len(), 2);
+        assert!(merged
+            .iter()
+            .all(|status| status.class_name != "StatusDeffenceBuff"));
+        assert!(merged
+            .iter()
+            .any(|status| status.class_name == "StatusDeffenceDebuff"));
     }
 }

@@ -43,22 +43,28 @@ export type DamageStatusContribution = {
   category: number;
   averageValue: number;
   activeHits: number;
+  multiplierContribution: number;
 };
 
 export type AverageDamageDetails = {
   hits: number;
   totalDamage: number;
-  elementalMultiplier: number;
-  amplifyMultiplier: number;
-  defenseMultiplier: number;
-  attackMultiplier: number;
-  supplementaryMultiplier: number;
-  formulaMultiplier: number;
-  observedMultiplier: number;
-  attackRate: number;
-  uncappedDamage: number;
-  damageCap: number;
-  damageLimitMultiplier: number;
+  supplementaryDamage: number;
+  normalizationDamage: number;
+  effectiveMultiplier: number;
+  recognizedMultiplier: number;
+  damageLimitContribution: number;
+  amplifyContribution: number;
+  attackDefenseContribution: number;
+  supplementaryContribution: number;
+  unattributedContribution: number;
+  averageDamageLimitMultiplier: number;
+  averageAmplifyMultiplier: number;
+  averageAttackDefenseMultiplier: number;
+  averageCriticalRate: number;
+  averageBaseDamage: number;
+  averageDamageCap: number;
+  cappedHits: number;
   statuses: DamageStatusContribution[];
 };
 

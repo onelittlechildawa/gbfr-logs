@@ -142,6 +142,7 @@ impl OnProcessDamageHook {
         } else {
             ActionType::Normal(damage_instance.action_id)
         };
+        let persist_damage_details = !matches!(action_type, ActionType::SupplementaryDamage(_));
 
         // Get the source actor's type ID.
         let source_type_id = actor_type_id(source_specified_instance_ptr as *const usize);
@@ -198,7 +199,14 @@ impl OnProcessDamageHook {
             attack_rate: None,
             damage_cap: Some(damage_instance.damage_cap),
             stun_value,
-            details: damage_details,
+            // Pursuit entries are already separate damage events. Persisting
+            // the originating hit's full status vector again only grows saved
+            // logs and previously encouraged double-counting the candidate e.
+            details: if persist_damage_details {
+                damage_details
+            } else {
+                None
+            },
         });
 
         let _ = self.tx.send(event);

@@ -1,6 +1,6 @@
 [package]
 name = "gbfr-logs"
-version = "1.8.6"
+version = "1.8.7-alpha1"
 description = "GBFR Logs Awa Edition"
 authors = ["onelittlechildawa"]
 edition = "2021"

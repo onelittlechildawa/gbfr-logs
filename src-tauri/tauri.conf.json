@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "GBFR Logs Awa Edition",
-    "version": "1.8.6"
+    "version": "1.8.7-2"
   },
   "tauri": {
     "allowlist": {

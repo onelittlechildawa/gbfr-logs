@@ -1,8 +1,7 @@
 import { CharacterType, ComputedSkillState } from "@/types";
 import { getSkillName } from "@/utils";
-import { ActionIcon, Tooltip } from "@mantine/core";
+import { Button, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { Info } from "@phosphor-icons/react";
 import { useTranslation } from "react-i18next";
 import { DamageDetailsModal } from "./DamageDetailsModal";
 import { useSkillRow } from "./useSkillRow";
@@ -94,9 +93,9 @@ export const SkillRow = ({ characterType, skill, color, nested }: SkillRowProps)
         <td className="text-center row-data">
           {skill.damageDetails && (
             <Tooltip label={t("ui.damage-details.open")}>
-              <ActionIcon size="sm" variant="subtle" aria-label={t("ui.damage-details.open")} onClick={openDetails}>
-                <Info size={15} />
-              </ActionIcon>
+              <Button size="compact-xs" variant="subtle" aria-label={t("ui.damage-details.open")} onClick={openDetails}>
+                {skill.damageDetails.effectiveMultiplier.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}×
+              </Button>
             </Tooltip>
           )}
         </td>

@@ -1,14 +1,25 @@
 use anyhow::anyhow;
+use log::{info, warn};
 use pelite::{
     pattern,
     pe64::{Pe, PeView},
 };
 use thiserror::Error;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Module32FirstW, Process32FirstW, Process32NextW, MODULEENTRY32W,
-    PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
+
+struct SnapshotHandle(HANDLE);
+
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ProcessError {
@@ -28,62 +39,106 @@ pub struct Process {
 impl Process {
     /// Finds a process by its name.
     pub fn with_name(name: &str) -> Result<Process, ProcessError> {
-        let mut found_process = None;
-
-        unsafe {
-            let snapshot_handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-                .map_err(ProcessError::ProcessSnapshotError)?;
+        let mut candidate_pids = unsafe {
+            let snapshot_handle = SnapshotHandle(
+                CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                    .map_err(ProcessError::ProcessSnapshotError)?,
+            );
 
             let mut process = PROCESSENTRY32W {
                 dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
                 ..PROCESSENTRY32W::default()
             };
+            Process32FirstW(snapshot_handle.0, &mut process)
+                .map_err(ProcessError::ProcessSnapshotError)?;
 
-            if Process32FirstW(snapshot_handle, &mut process).is_ok() {
-                loop {
-                    if Process32NextW(snapshot_handle, &mut process).is_ok() {
-                        let process_name = String::from_utf16_lossy(&process.szExeFile)
-                            .trim_end_matches('\u{0}')
-                            .to_string();
+            let mut candidates = Vec::new();
+            loop {
+                let process_name = String::from_utf16_lossy(&process.szExeFile)
+                    .trim_end_matches('\u{0}')
+                    .to_string();
 
-                        if process_name == name {
-                            let module_snapshot = CreateToolhelp32Snapshot(
-                                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                                process.th32ProcessID,
-                            )
-                            .map_err(ProcessError::ModuleSnapshotError)?;
+                if process_name.eq_ignore_ascii_case(name) {
+                    candidates.push(process.th32ProcessID);
+                }
 
-                            let mut module_entry = MODULEENTRY32W {
-                                dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
-                                ..MODULEENTRY32W::default()
-                            };
+                if Process32NextW(snapshot_handle.0, &mut process).is_err() {
+                    break;
+                }
+            }
 
-                            if Module32FirstW(module_snapshot, &mut module_entry).is_ok() {
-                                let module_name = String::from_utf16_lossy(&process.szExeFile)
-                                    .trim_end_matches('\u{0}')
-                                    .to_string();
+            candidates
+        };
 
-                                if module_name == name {
-                                    let base_address = module_entry.modBaseAddr as usize;
-                                    let module_handle = module_entry.hModule;
+        if candidate_pids.is_empty() {
+            return Err(ProcessError::ProcessNotFound);
+        }
 
-                                    found_process = Some(Process {
-                                        base_address,
-                                        module_handle,
-                                    });
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    } else {
-                        break;
-                    }
+        // The hook is loaded inside the real game process, so prefer its PID if it
+        // appears among duplicate executable names. Keep the remaining candidates
+        // as fallbacks for compatibility with callers outside the injected DLL.
+        let current_pid = std::process::id();
+        candidate_pids.sort_by_key(|pid| *pid != current_pid);
+
+        let mut last_snapshot_error = None;
+        for pid in candidate_pids {
+            info!("trying module snapshot pid={pid}");
+
+            match Self::from_pid_and_module_name(pid, name) {
+                Ok(Some(process)) => return Ok(process),
+                Ok(None) => {
+                    warn!("target module was not found pid={pid}; trying next candidate");
+                }
+                Err(error) => {
+                    warn!(
+                        "module snapshot failed pid={pid} error={error:?}; trying next candidate"
+                    );
+                    last_snapshot_error = Some(error);
                 }
             }
         }
 
-        found_process.ok_or(ProcessError::ProcessNotFound)
+        match last_snapshot_error {
+            Some(error) => Err(ProcessError::ModuleSnapshotError(error)),
+            None => Err(ProcessError::ProcessNotFound),
+        }
+    }
+
+    fn from_pid_and_module_name(
+        pid: u32,
+        name: &str,
+    ) -> Result<Option<Process>, windows::core::Error> {
+        unsafe {
+            let module_snapshot = SnapshotHandle(CreateToolhelp32Snapshot(
+                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                pid,
+            )?);
+
+            let mut module_entry = MODULEENTRY32W {
+                dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
+                ..MODULEENTRY32W::default()
+            };
+            Module32FirstW(module_snapshot.0, &mut module_entry)?;
+
+            loop {
+                let module_name = String::from_utf16_lossy(&module_entry.szModule)
+                    .trim_end_matches('\u{0}')
+                    .to_string();
+
+                if module_name.eq_ignore_ascii_case(name) {
+                    return Ok(Some(Process {
+                        base_address: module_entry.modBaseAddr as usize,
+                        module_handle: module_entry.hModule,
+                    }));
+                }
+
+                if Module32NextW(module_snapshot.0, &mut module_entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Searches and returns the RVAs of the function that matches the given signature pattern.

@@ -97,6 +97,17 @@ static IDENTITIES: OnceLock<Mutex<IdentityStore>> = OnceLock::new();
 static ACTOR_KEYS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
 static ACTOR_IDENTITIES: OnceLock<Mutex<HashMap<usize, StoredPlayerIdentity>>> = OnceLock::new();
 
+#[cfg(feature = "identity-debug")]
+pub(super) fn known_player_actor_addresses() -> Vec<usize> {
+    ACTOR_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("actor identity cache lock poisoned")
+        .keys()
+        .copied()
+        .collect()
+}
+
 pub(super) fn reset_battle_identity_state() {
     if let Some(identities) = IDENTITIES.get() {
         identities

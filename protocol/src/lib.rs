@@ -104,17 +104,24 @@ pub struct DamageStatusContribution {
 
 /// The resolved factors for one damage event.
 ///
-/// `formula_multiplier` follows the requested community formula:
-/// `(elemental * amplify + (defense * attack - 1) / 2) * supplementary`.
+/// Field order is frozen for bincode compatibility. Some historical names no
+/// longer describe the corrected game 2.0 semantics; the parser exposes the
+/// normalized names used by the UI.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DamageDetails {
+    /// Legacy name: this now carries the probability written at damage +0x2D8.
     pub elemental_multiplier: f32,
     pub amplify_multiplier: f32,
+    /// Legacy name: authoritative native attack/defense aggregate (CD).
     pub defense_multiplier: f32,
     pub attack_multiplier: f32,
+    /// Pursuit is emitted separately; corrected hooks write 1.0 here.
     pub supplementary_multiplier: f32,
+    /// Recognized multiplier: damage_limit * amplify + max(CD - 1, 0) / 2.
     pub formula_multiplier: f32,
     pub attack_rate: f32,
+    /// Corrected hooks store the post-clamp normalization base in this legacy
+    /// field to avoid increasing every persisted damage event.
     pub uncapped_damage: f32,
     pub damage_cap: i32,
     pub damage_limit_multiplier: f32,

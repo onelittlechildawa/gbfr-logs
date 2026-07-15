@@ -90,6 +90,20 @@ impl PlayerState {
             damage_instance.event.action_id
         };
 
+        // Pursuit remains a separate row for damage accounting, but its actual
+        // damage also contributes to the originating skill's single effective
+        // multiplier. ActionType already carries the original normal-skill ID,
+        // so no per-hit linkage or extra persisted payload is required.
+        if let ActionType::SupplementaryDamage(original_action_id) = action {
+            let original_action = ActionType::Normal(original_action_id);
+            if let Some(originating_skill) = self.skill_breakdown.iter_mut().find(|skill| {
+                skill.action_type == original_action
+                    && skill.child_character_type == child_character_type
+            }) {
+                originating_skill.add_supplementary_damage(damage_instance.event.damage as u64);
+            }
+        }
+
         // If the skill is already being tracked, update it.
         for skill in self.skill_breakdown.iter_mut() {
             // Aggregate all supplementary damage events into the same skill instance.
@@ -495,5 +509,73 @@ mod tests {
         ));
 
         assert_eq!(player_state.total_stun_value, 5.0);
+    }
+
+    #[test]
+    fn supplementary_damage_updates_the_originating_effective_multiplier() {
+        let mut player_state = PlayerState {
+            index: 0,
+            character_type: CharacterType::Pl0000,
+            total_damage: 0,
+            last_known_pet_skill: None,
+            dps: 0.0,
+            skill_breakdown: vec![],
+            sba: 0.0,
+            total_stun_value: 0.0,
+            stun_per_second: 0.0,
+        };
+        let actor = protocol::Actor {
+            index: 0,
+            actor_type: 0,
+            parent_actor_type: 0,
+            parent_index: 0,
+        };
+        let origin = DamageEvent {
+            source: actor.clone(),
+            target: actor.clone(),
+            action_id: ActionType::Normal(1),
+            damage: 100,
+            flags: 0,
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: Some(100),
+            details: Some(protocol::DamageDetails {
+                elemental_multiplier: 0.0,
+                amplify_multiplier: 1.0,
+                defense_multiplier: 1.0,
+                attack_multiplier: 1.0,
+                supplementary_multiplier: 1.0,
+                formula_multiplier: 1.0,
+                attack_rate: 1.0,
+                uncapped_damage: 100.0,
+                damage_cap: 100,
+                damage_limit_multiplier: 1.0,
+                statuses: Vec::new(),
+            }),
+        };
+        let pursuit = DamageEvent {
+            source: actor.clone(),
+            target: actor,
+            action_id: ActionType::SupplementaryDamage(1),
+            damage: 50,
+            flags: 1 << 15,
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: None,
+            details: None,
+        };
+
+        player_state
+            .update_from_damage_event(&AdjustedDamageInstance::from_damage_event(&origin, None));
+        player_state
+            .update_from_damage_event(&AdjustedDamageInstance::from_damage_event(&pursuit, None));
+
+        let details = player_state.skill_breakdown[0]
+            .damage_details
+            .as_ref()
+            .unwrap();
+        assert_eq!(details.supplementary_damage, 50);
+        assert!((details.supplementary_contribution - 0.5).abs() < 0.0001);
+        assert!((details.effective_multiplier - 1.5).abs() < 0.0001);
     }
 }

@@ -5,6 +5,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+#[cfg(feature = "identity-debug")]
+use std::collections::HashSet;
+
 use anyhow::Result;
 use log::{info, warn};
 use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::ReadProcessMemory};
@@ -28,6 +31,10 @@ type GetEntityHashID0x58 = unsafe extern "system" fn(*const usize, *const u32) -
 const ID_HUMAN_TYPE: u32 = 0x8056ABCD;
 const ID_DRAGON_TYPE: u32 = 0xF5755C0E;
 const ID_DRAGON_PARENT_ENTITY_OFFSET: usize = 0x1CA98;
+const FERRY_TYPE: u32 = 0xFBA6615D;
+/// Game 2.0.2 moved Pl0700Ghost's owning Entity pointer forward by 0x10.
+/// Four independent pets all resolved through this exact field in live combat.
+const FERRY_GHOST_PARENT_ENTITY_OFFSET: usize = 0xE58;
 
 /// Game 2.0 removed the party index from the offset used by older releases. Keep a
 /// process-local ID for every concrete actor instance instead. Two players using the
@@ -57,6 +64,9 @@ impl ActorIds {
 }
 
 static ACTOR_IDS: OnceLock<Mutex<ActorIds>> = OnceLock::new();
+
+#[cfg(feature = "identity-debug")]
+static PROBED_PARENT_ACTORS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 
 pub fn setup_hooks(tx: event::Tx) -> Result<()> {
     let process = Process::with_name("granblue_fantasy_relink.exe")?;
@@ -144,15 +154,30 @@ pub fn get_source_parent_instance(
     match source_type_id {
         // Pl0700Ghost -> Pl0700
         0x2AF678E8 => {
-            let parent_instance = parent_specified_instance_at(source, 0xE48)?;
+            let parent_instance =
+                parent_specified_instance_at(source, FERRY_GHOST_PARENT_ENTITY_OFFSET);
 
-            Some((actor_type_id(parent_instance), parent_instance))
+            #[cfg(feature = "identity-debug")]
+            if parent_instance.is_none() {
+                probe_parent_offsets(source_type_id, source);
+            }
+
+            let parent_instance = parent_instance?;
+
+            Some((FERRY_TYPE, parent_instance))
         }
         // Pl0700GhostSatellite -> Pl0700
         0x8364C8BC => {
-            let parent_instance = parent_specified_instance_at(source, 0x508)?;
+            let parent_instance = parent_specified_instance_at(source, 0x508);
 
-            Some((actor_type_id(parent_instance), parent_instance))
+            #[cfg(feature = "identity-debug")]
+            if parent_instance.is_none() {
+                probe_parent_offsets(source_type_id, source);
+            }
+
+            let parent_instance = parent_instance?;
+
+            Some((FERRY_TYPE, parent_instance))
         }
         // Wp1890: Cagliostro's Ouroboros Dragon Sled -> Pl1800
         0xC9F45042 => {
@@ -203,6 +228,64 @@ fn parent_specified_instance_at(actor_ptr: *const usize, offset: usize) -> Optio
 
     let parent = read_process_value::<*const usize>(entity.wrapping_byte_add(0x70).cast())?;
     (!parent.is_null()).then_some(parent)
+}
+
+#[cfg(feature = "identity-debug")]
+fn probe_parent_offsets(source_type_id: u32, source: *const usize) {
+    if source.is_null() {
+        return;
+    }
+
+    let source_address = source as usize;
+    let first_probe = PROBED_PARENT_ACTORS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("parent probe set lock poisoned")
+        .insert(source_address);
+    if !first_probe {
+        return;
+    }
+
+    let known_players = player::known_player_actor_addresses();
+    info!(
+        "Parent offset probe started: source={source_address:#x}, type={source_type_id:#010x}, known_players={known_players:?}"
+    );
+
+    let mut matches = 0usize;
+    for offset in (0..=0x3000usize).step_by(std::mem::size_of::<usize>()) {
+        let Some(candidate) =
+            read_process_value::<usize>(source.wrapping_byte_add(offset).cast::<usize>())
+        else {
+            continue;
+        };
+
+        if known_players.contains(&candidate) {
+            matches += 1;
+            info!(
+                "Parent offset probe direct match: source={source_address:#x}, offset={offset:#x}, player={candidate:#x}"
+            );
+        }
+
+        if !(0x1_0000..=0x0000_7fff_ffff_ffff).contains(&candidate) {
+            continue;
+        }
+
+        let specified = read_process_value::<usize>(
+            (candidate as *const u8)
+                .wrapping_byte_add(0x70)
+                .cast::<usize>(),
+        );
+        if let Some(specified) = specified.filter(|value| known_players.contains(value)) {
+            matches += 1;
+            info!(
+                "Parent offset probe entity match: source={source_address:#x}, offset={offset:#x}, entity={candidate:#x}, player={specified:#x}"
+            );
+        }
+    }
+
+    info!(
+        "Parent offset probe finished: source={source_address:#x}, type={source_type_id:#010x}, matches={matches}"
+    );
 }
 
 /// Reads hook-owned game memory without letting an invalid pointer raise an
@@ -261,7 +344,8 @@ pub(super) fn read_process_bytes(address: *const u8, length: usize) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_idx, parent_specified_instance_at, ActorIds, ID_DRAGON_PARENT_ENTITY_OFFSET,
+        actor_idx, parent_specified_instance_at, ActorIds, FERRY_GHOST_PARENT_ENTITY_OFFSET,
+        ID_DRAGON_PARENT_ENTITY_OFFSET,
     };
 
     #[test]
@@ -284,6 +368,11 @@ mod tests {
 
         assert_eq!(actor_ids.id_for(0x2000), 0);
         assert_eq!(actor_ids.id_for(0x1000), 1);
+    }
+
+    #[test]
+    fn ferry_ghost_uses_the_verified_game_2_parent_offset() {
+        assert_eq!(FERRY_GHOST_PARENT_ENTITY_OFFSET, 0xE58);
     }
 
     #[test]

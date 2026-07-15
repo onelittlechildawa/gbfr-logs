@@ -1,16 +1,7 @@
-import { getVersion as tauriVersion } from "@tauri-apps/api/app";
-import { useEffect, useState } from "react";
+import packageInfo from "../../package.json";
 
 export default function getVersion() {
-  const [version, setVersion] = useState<string>("0.0.0");
-
-  useEffect(() => {
-    tauriVersion().then((v) => {
-      setVersion(v);
-    });
-  });
-
   return {
-    version,
+    version: packageInfo.version,
   };
 }
