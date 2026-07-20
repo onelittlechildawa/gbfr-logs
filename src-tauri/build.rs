@@ -8,7 +8,8 @@ fn main() {
     // The Tauri bundle reads this resource from src-tauri. Copy it for both
     // debug and release builds so an MSI can never silently package a stale
     // hook from an earlier test run.
-    let _ = fs::copy("../target/release/hook.dll", "hook.dll");
+    fs::copy("../target/release/hook.dll", "hook.dll")
+        .expect("Could not copy the freshly built release hook.dll into the Tauri resources.");
 
     if cfg!(debug_assertions) {
         tauri_build::build();

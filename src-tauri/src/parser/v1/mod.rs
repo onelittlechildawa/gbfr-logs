@@ -7,7 +7,10 @@ use protocol::{
     OnPerformSBAEvent, OnUpdateSBAEvent, PlayerIdentityEvent, PlayerLoadEvent, QuestCompleteEvent,
 };
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::{
+    ser::{SerializeMap, SerializeSeq, SerializeStruct},
+    Deserialize, Serialize, Serializer,
+};
 use tauri::{AppHandle, Manager, Window};
 
 use super::{
@@ -19,6 +22,7 @@ mod player_state;
 mod skill_state;
 
 use player_state::PlayerState;
+use skill_state::SkillState;
 
 pub struct AdjustedDamageInstance<'a> {
     pub event: &'a DamageEvent,
@@ -278,6 +282,13 @@ impl Encounter {
         self.raw_event_log.push((timestamp, event));
     }
 
+    fn clear_event_log(&mut self) {
+        self.event_log.clear();
+        self.event_log.shrink_to_fit();
+        self.raw_event_log.clear();
+        self.raw_event_log.shrink_to_fit();
+    }
+
     pub fn event_log(&self) -> impl Iterator<Item = &(i64, Message)> {
         self.raw_event_log.iter()
     }
@@ -409,6 +420,109 @@ impl DerivedEncounterState {
     }
 }
 
+/// Lightweight serialization used only by the real-time Meter window.
+///
+/// Damage details remain in `DerivedEncounterState` for saved logs, but sending
+/// them on every hit makes Tauri 1 compile the growing payload as a fresh
+/// JavaScript program for each event. Keep the event schema compatible by
+/// serializing `damageDetails` as null without cloning the full encounter.
+#[derive(Clone, Copy)]
+struct MeterEncounterState<'a>(&'a DerivedEncounterState);
+
+struct MeterParty<'a>(&'a HashMap<u32, PlayerState>);
+struct MeterPlayerState<'a>(&'a PlayerState);
+struct MeterSkillBreakdown<'a>(&'a [SkillState]);
+struct MeterSkillState<'a>(&'a SkillState);
+
+impl Serialize for MeterEncounterState<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encounter = self.0;
+        let mut state = serializer.serialize_struct("DerivedEncounterState", 9)?;
+        state.serialize_field("startTime", &encounter.start_time)?;
+        state.serialize_field("endTime", &encounter.end_time)?;
+        state.serialize_field("totalDamage", &encounter.total_damage)?;
+        state.serialize_field("dps", &encounter.dps)?;
+        state.serialize_field("totalStunValue", &encounter.total_stun_value)?;
+        state.serialize_field("stunPerSecond", &encounter.stun_per_second)?;
+        state.serialize_field("status", &encounter.status)?;
+        state.serialize_field("party", &MeterParty(&encounter.party))?;
+        state.serialize_field("targets", &encounter.targets)?;
+        state.end()
+    }
+}
+
+impl Serialize for MeterParty<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut party = serializer.serialize_map(Some(self.0.len()))?;
+        for (actor_index, player) in self.0 {
+            party.serialize_entry(actor_index, &MeterPlayerState(player))?;
+        }
+        party.end()
+    }
+}
+
+impl Serialize for MeterPlayerState<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let player = self.0;
+        let mut state = serializer.serialize_struct("PlayerState", 9)?;
+        state.serialize_field("index", &player.index)?;
+        state.serialize_field("characterType", &player.character_type)?;
+        state.serialize_field("totalDamage", &player.total_damage)?;
+        state.serialize_field("lastKnownPetSkill", &player.last_known_pet_skill)?;
+        state.serialize_field("dps", &player.dps)?;
+        state.serialize_field(
+            "skillBreakdown",
+            &MeterSkillBreakdown(&player.skill_breakdown),
+        )?;
+        state.serialize_field("sba", &player.sba)?;
+        state.serialize_field("totalStunValue", &player.total_stun_value)?;
+        state.serialize_field("stunPerSecond", &player.stun_per_second)?;
+        state.end()
+    }
+}
+
+impl Serialize for MeterSkillBreakdown<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut skills = serializer.serialize_seq(Some(self.0.len()))?;
+        for skill in self.0 {
+            skills.serialize_element(&MeterSkillState(skill))?;
+        }
+        skills.end()
+    }
+}
+
+impl Serialize for MeterSkillState<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let skill = self.0;
+        let mut state = serializer.serialize_struct("SkillState", 9)?;
+        state.serialize_field("actionType", &skill.action_type)?;
+        state.serialize_field("childCharacterType", &skill.child_character_type)?;
+        state.serialize_field("hits", &skill.hits)?;
+        state.serialize_field("minDamage", &skill.min_damage)?;
+        state.serialize_field("maxDamage", &skill.max_damage)?;
+        state.serialize_field("totalDamage", &skill.total_damage)?;
+        state.serialize_field("maxStunValue", &skill.max_stun_value)?;
+        state.serialize_field("totalStunValue", &skill.total_stun_value)?;
+        state.serialize_field("damageDetails", &Option::<()>::None)?;
+        state.end()
+    }
+}
+
 /// The parser for the encounter.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Parser {
@@ -439,6 +553,12 @@ impl Parser {
             db: Some(db),
             window_handle: Some(window),
             ..Default::default()
+        }
+    }
+
+    fn emit_meter_event(&self, event: &str) {
+        if let Some(window) = &self.window_handle {
+            let _ = window.emit(event, MeterEncounterState(&self.derived_state));
         }
     }
 
@@ -601,6 +721,7 @@ impl Parser {
             if self.has_damage() {
                 match self.save_encounter_to_db() {
                     Ok(id) => {
+                        self.encounter.clear_event_log();
                         if let Some(app) = &self.app {
                             let _ = app.emit_all("encounter-saved", id);
                         }
@@ -619,9 +740,7 @@ impl Parser {
         self.encounter.quest_completed = false;
         self.encounter.reset_player_data();
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("on-area-enter", &self.derived_state);
-        }
+        self.emit_meter_event("on-area-enter");
     }
 
     pub fn on_quest_complete_event(&mut self, event: QuestCompleteEvent) {
@@ -635,6 +754,7 @@ impl Parser {
             if self.has_damage() {
                 match self.save_encounter_to_db() {
                     Ok(id) => {
+                        self.encounter.clear_event_log();
                         if let Some(window) = &self.window_handle {
                             let _ = window.emit("encounter-saved", id);
                         }
@@ -647,9 +767,7 @@ impl Parser {
                 }
             }
 
-            if let Some(window) = &self.window_handle {
-                let _ = window.emit("encounter-update", &self.derived_state);
-            }
+            self.emit_meter_event("encounter-update");
         }
     }
 
@@ -683,9 +801,7 @@ impl Parser {
         self.derived_state
             .process_damage_event(now, &damage_instance);
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("encounter-update", &self.derived_state);
-        }
+        self.emit_meter_event("encounter-update");
     }
 
     /// Saves an active encounter after combat has been quiet long enough.
@@ -726,15 +842,18 @@ impl Parser {
 
         match self.save_encounter_to_db() {
             Ok(id) => {
+                // The database now owns the complete compressed encounter.
+                // Keep the derived summary visible, but release the much larger
+                // per-hit payload immediately instead of waiting for another hit.
+                self.encounter.clear_event_log();
+
                 if let Some(app) = &self.app {
                     let _ = app.emit_all("encounter-saved", id);
                 } else if let Some(window) = &self.window_handle {
                     let _ = window.emit("encounter-saved", id);
                 }
 
-                if let Some(window) = &self.window_handle {
-                    let _ = window.emit("encounter-update", &self.derived_state);
-                }
+                self.emit_meter_event("encounter-update");
                 true
             }
             Err(e) => {
@@ -744,9 +863,7 @@ impl Parser {
                     let _ = window.emit("encounter-saved-error", e.to_string());
                 }
 
-                if let Some(window) = &self.window_handle {
-                    let _ = window.emit("encounter-update", &self.derived_state);
-                }
+                self.emit_meter_event("encounter-update");
                 false
             }
         }
@@ -821,6 +938,23 @@ impl Parser {
             return;
         }
 
+        let display_name = event.display_name.to_string_lossy().to_string();
+        let character_name = event.character_name.to_string_lossy().to_string();
+
+        // Identity events are metadata refreshes. Ignore a repeat snapshot so
+        // the WebView does not receive and render the same four-player array on
+        // every hit if an older hook still broadcasts identities per damage.
+        if self.player_identity_is_current(
+            event.party_index,
+            event.actor_index,
+            character_type,
+            &display_name,
+            &character_name,
+            event.is_online,
+        ) {
+            return;
+        }
+
         let mut player_data = self
             .encounter
             .player_data
@@ -840,12 +974,52 @@ impl Parser {
                 player_stats: None,
             });
 
-        player_data.display_name = event.display_name.to_string_lossy().to_string();
-        player_data.character_name = event.character_name.to_string_lossy().to_string();
+        player_data.display_name = display_name;
+        player_data.character_name = character_name;
         player_data.character_type = character_type;
         player_data.is_online = event.is_online;
 
         self.insert_player_identity_data(player_data, event.party_index);
+    }
+
+    fn player_identity_is_current(
+        &self,
+        party_index: u8,
+        actor_index: u32,
+        character_type: CharacterType,
+        display_name: &str,
+        character_name: &str,
+        is_online: bool,
+    ) -> bool {
+        let party_index = usize::from(party_index);
+        if party_index >= self.encounter.player_data.len() {
+            return false;
+        }
+
+        let actor_is_duplicated =
+            self.encounter
+                .player_data
+                .iter()
+                .enumerate()
+                .any(|(index, player)| {
+                    index != party_index
+                        && player
+                            .as_ref()
+                            .is_some_and(|player| player.actor_index == actor_index)
+                });
+        if actor_is_duplicated {
+            return false;
+        }
+
+        self.encounter.player_data[party_index]
+            .as_ref()
+            .is_some_and(|player| {
+                player.actor_index == actor_index
+                    && player.character_type == character_type
+                    && player.display_name == display_name
+                    && player.character_name == character_name
+                    && player.is_online == is_online
+            })
     }
 
     fn insert_player_data(&mut self, player_data: PlayerData, party_index: u8) {
@@ -896,9 +1070,7 @@ impl Parser {
             player.set_sba(event.sba_value as f64);
         }
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("encounter-update", &self.derived_state);
-        }
+        self.emit_meter_event("encounter-update");
     }
 
     pub fn on_sba_attempt(&mut self, event: OnAttemptSBAEvent) {
@@ -912,9 +1084,7 @@ impl Parser {
             player.set_sba(800.0);
         }
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("encounter-update", &self.derived_state);
-        }
+        self.emit_meter_event("encounter-update");
     }
 
     pub fn on_sba_perform(&mut self, event: OnPerformSBAEvent) {
@@ -928,9 +1098,7 @@ impl Parser {
             player.set_sba(0.0);
         }
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("encounter-update", &self.derived_state);
-        }
+        self.emit_meter_event("encounter-update");
     }
 
     /// @TODO(false): Note that this event only fires for the local player.
@@ -945,9 +1113,7 @@ impl Parser {
             player.set_sba(0.0);
         }
 
-        if let Some(window) = &self.window_handle {
-            let _ = window.emit("encounter-update", &self.derived_state);
-        }
+        self.emit_meter_event("encounter-update");
     }
 
     pub fn on_death_event(&mut self, event: OnDeathEvent) {
@@ -958,8 +1124,7 @@ impl Parser {
     }
 
     fn reset(&mut self) {
-        self.encounter.raw_event_log.clear();
-        self.encounter.raw_event_log.shrink_to_fit();
+        self.encounter.clear_event_log();
         self.derived_state = Default::default();
     }
 
@@ -1087,7 +1252,7 @@ impl From<v0::Parser> for Parser {
 mod tests {
     use std::ffi::CString;
 
-    use protocol::{ActionType, Actor};
+    use protocol::{ActionType, Actor, DamageDetails};
 
     use super::*;
 
@@ -1097,6 +1262,95 @@ mod tests {
 
         assert_eq!(parser.status, ParserStatus::Waiting);
         assert_eq!(parser.start_time(), 1);
+    }
+
+    #[test]
+    fn meter_payload_hides_details_without_removing_them_from_logs() {
+        let mut parser = Parser::default();
+        parser.on_damage_event(DamageEvent {
+            source: Actor {
+                index: 1,
+                actor_type: 0x4C714F77,
+                parent_actor_type: 0x4C714F77,
+                parent_index: 1,
+            },
+            target: Actor {
+                index: 2,
+                actor_type: 0x12345678,
+                parent_actor_type: 0x12345678,
+                parent_index: 2,
+            },
+            damage: 100,
+            flags: 0,
+            action_id: ActionType::Normal(0),
+            attack_rate: None,
+            stun_value: None,
+            damage_cap: Some(100),
+            details: Some(DamageDetails {
+                elemental_multiplier: 0.0,
+                amplify_multiplier: 1.0,
+                defense_multiplier: 1.0,
+                attack_multiplier: 1.0,
+                supplementary_multiplier: 1.0,
+                formula_multiplier: 1.0,
+                attack_rate: 1.0,
+                uncapped_damage: 100.0,
+                damage_cap: 100,
+                damage_limit_multiplier: 1.0,
+                statuses: Vec::new(),
+            }),
+        });
+
+        let full = serde_json::to_value(&parser.derived_state).unwrap();
+        let meter = serde_json::to_value(MeterEncounterState(&parser.derived_state)).unwrap();
+        let full_skill = &full["party"]["1"]["skillBreakdown"][0];
+        let meter_skill = &meter["party"]["1"]["skillBreakdown"][0];
+
+        assert!(full_skill["damageDetails"].is_object());
+        assert!(meter_skill["damageDetails"].is_null());
+        assert_eq!(meter_skill["hits"], full_skill["hits"]);
+        assert_eq!(meter_skill["totalDamage"], full_skill["totalDamage"]);
+        assert!(parser.derived_state.party[&1].skill_breakdown[0]
+            .damage_details
+            .is_some());
+
+        let mut expected_meter = full;
+        for player in expected_meter["party"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            for skill in player["skillBreakdown"].as_array_mut().unwrap() {
+                skill["damageDetails"] = serde_json::Value::Null;
+            }
+        }
+        assert_eq!(meter, expected_meter);
+    }
+
+    #[test]
+    fn repeated_player_identity_snapshot_is_a_noop() {
+        let mut parser = Parser::default();
+        let event = PlayerIdentityEvent {
+            character_name: CString::new("Character").unwrap(),
+            display_name: CString::new("Player").unwrap(),
+            character_type: 0x4C714F77,
+            party_index: 0,
+            actor_index: 9,
+            is_online: false,
+        };
+
+        parser.on_player_identity_event(event.clone());
+        assert!(parser.player_identity_is_current(
+            event.party_index,
+            event.actor_index,
+            CharacterType::from_hash(event.character_type),
+            "Player",
+            "Character",
+            event.is_online,
+        ));
+
+        parser.on_player_identity_event(event);
+        assert_eq!(parser.encounter.player_data.iter().flatten().count(), 1);
     }
 
     #[test]
@@ -1130,6 +1384,7 @@ mod tests {
         assert!(!parser.auto_save_if_inactive(last_damage_at + 60_000));
         assert!(parser.auto_save_if_inactive(last_damage_at + AUTO_SAVE_INACTIVITY_MS));
         assert_eq!(parser.status, ParserStatus::Stopped);
+        assert!(parser.encounter.raw_event_log.is_empty());
         assert!(!parser.auto_save_if_inactive(last_damage_at + AUTO_SAVE_INACTIVITY_MS * 2));
     }
 
@@ -1168,6 +1423,7 @@ mod tests {
 
         assert!(parser.on_battle_end_event());
         assert_eq!(parser.status, ParserStatus::Stopped);
+        assert!(parser.encounter.raw_event_log.is_empty());
         assert!(parser.encounter.player_data.iter().all(Option::is_none));
         assert!(!parser.on_battle_end_event());
 

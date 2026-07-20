@@ -104,6 +104,13 @@ pub fn setup_hooks(tx: event::Tx) -> Result<()> {
     Ok(())
 }
 
+/// The injected hook can outlive the desktop app. When a new pipe client
+/// connects, allow the already-resolved actors to publish their identities
+/// once more so the fresh parser receives the party snapshot.
+pub(crate) fn reset_client_identity_emissions() {
+    player::reset_emitted_identity_state();
+}
+
 #[inline(always)]
 pub unsafe fn v_func<T: Sized>(ptr: *const usize, offset: usize) -> T {
     ((ptr.read() as *const usize).byte_add(offset) as *const T).read()

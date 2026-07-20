@@ -4,13 +4,14 @@ import { CaretDown, CaretUp } from "@phosphor-icons/react";
 import { SkillRow } from "./SkillRow";
 import { useSkillGroupRow } from "./useSkillGroupRow";
 
-export type SkillRowProps = {
+export type SkillGroupRowProps = {
   characterType: CharacterType;
   group: ComputedSkillGroup;
   color: string;
+  showDamageDetails: boolean;
 };
 
-export const SkillGroupRow = ({ characterType, group, color }: SkillRowProps) => {
+export const SkillGroupRow = ({ characterType, group, color, showDamageDetails }: SkillGroupRowProps) => {
   const {
     showFullValues,
     totalDamage,
@@ -87,7 +88,7 @@ export const SkillGroupRow = ({ characterType, group, color }: SkillRowProps) =>
           {group.percentage.toFixed(0)}
           <span className="unit font-sm">%</span>
         </td>
-        <td className="text-center row-data" />
+        {showDamageDetails && <td className="text-center row-data" />}
         <div className="damage-bar" style={{ backgroundColor: color, width: `${group.percentage}%` }} />
       </tr>
       {expanded &&
@@ -98,6 +99,7 @@ export const SkillGroupRow = ({ characterType, group, color }: SkillRowProps) =>
             skill={skill}
             color={color}
             nested
+            showDamageDetails={showDamageDetails}
           />
         ))}
     </>

@@ -1,11 +1,12 @@
 {
   "name": "gbfr-logs",
   "private": true,
-  "version": "1.8.7-alpha1",
+  "version": "1.8.7",
   "type": "module",
   "scripts": {
     "dev": "cargo build --release --package hook --features hook/console && vite",
     "build": "tsc && vite build",
+    "build:bundle": "cargo build --release --package hook && npm run build",
     "preview": "vite preview",
     "lint": "eslint ./src",
     "tsc": "tsc",

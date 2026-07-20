@@ -52,6 +52,7 @@ impl Server {
                 match read_pipe {
                     Ok(stream) => {
                         let rx = self.tx.subscribe();
+                        hooks::reset_client_identity_emissions();
                         tokio::spawn(async move {
                             let encoder = LengthDelimitedCodec::new();
                             let writer = FramedWrite::new(stream, encoder);

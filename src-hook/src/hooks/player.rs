@@ -56,6 +56,13 @@ struct StoredPartyIdentity {
     identity: StoredPlayerIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmittedActorIdentity {
+    identity: StoredPlayerIdentity,
+    character_type: u32,
+    actor_index: u32,
+}
+
 #[derive(Default)]
 struct IdentityStore {
     by_party: HashMap<u8, StoredPartyIdentity>,
@@ -96,6 +103,8 @@ impl IdentityStore {
 static IDENTITIES: OnceLock<Mutex<IdentityStore>> = OnceLock::new();
 static ACTOR_KEYS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
 static ACTOR_IDENTITIES: OnceLock<Mutex<HashMap<usize, StoredPlayerIdentity>>> = OnceLock::new();
+static EMITTED_ACTOR_IDENTITIES: OnceLock<Mutex<HashMap<usize, EmittedActorIdentity>>> =
+    OnceLock::new();
 
 #[cfg(feature = "identity-debug")]
 pub(super) fn known_player_actor_addresses() -> Vec<usize> {
@@ -125,6 +134,19 @@ pub(super) fn reset_battle_identity_state() {
         actor_identities
             .lock()
             .expect("actor identity cache lock poisoned")
+            .clear();
+    }
+    reset_emitted_identity_state();
+}
+
+/// A newly connected meter has no party snapshot even if the injected hook
+/// already resolved every actor. Re-emit each actor once for the new client,
+/// while keeping the game-memory resolution caches warm.
+pub(super) fn reset_emitted_identity_state() {
+    if let Some(emitted_identities) = EMITTED_ACTOR_IDENTITIES.get() {
+        emitted_identities
+            .lock()
+            .expect("emitted actor identity map lock poisoned")
             .clear();
     }
 }
@@ -235,6 +257,7 @@ impl OnLoadPlayerIdentityHook {
                 .lock()
                 .expect("actor identity cache lock poisoned")
                 .clear();
+            reset_emitted_identity_state();
         }
     }
 }
@@ -258,6 +281,21 @@ pub fn identity_events_for_actor(
 
     let actor_address = actor as usize;
 
+    // The original meter reports player metadata when it changes, not on every
+    // damage event. Our game 2 fallback resolves identities from damage actors,
+    // so explicitly suppress repeat events after the first successful mapping.
+    if EMITTED_ACTOR_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("emitted actor identity map lock poisoned")
+        .get(&actor_address)
+        .is_some_and(|emitted| {
+            emitted.character_type == character_type && emitted.actor_index == actor_index
+        })
+    {
+        return Vec::new();
+    }
+
     if let Some(identity) = ACTOR_IDENTITIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -265,7 +303,7 @@ pub fn identity_events_for_actor(
         .get(&actor_address)
         .cloned()
     {
-        return vec![identity_event(identity, character_type, actor_index)];
+        return changed_identity_event(actor_address, identity, character_type, actor_index);
     }
 
     if let Some(identity) = read_actor_identity(actor) {
@@ -281,7 +319,7 @@ pub fn identity_events_for_actor(
             .expect("actor identity cache lock poisoned")
             .insert(actor_address, identity.clone());
 
-        return vec![identity_event(identity, character_type, actor_index)];
+        return changed_identity_event(actor_address, identity, character_type, actor_index);
     }
 
     let cached_key = ACTOR_KEYS
@@ -351,6 +389,30 @@ pub fn identity_events_for_actor(
         .expect("actor identity cache lock poisoned")
         .insert(actor_address, identity.clone());
 
+    changed_identity_event(actor_address, identity, character_type, actor_index)
+}
+
+fn changed_identity_event(
+    actor_address: usize,
+    identity: StoredPlayerIdentity,
+    character_type: u32,
+    actor_index: u32,
+) -> Vec<PlayerIdentityEvent> {
+    let emitted = EmittedActorIdentity {
+        identity: identity.clone(),
+        character_type,
+        actor_index,
+    };
+    let mut emitted_identities = EMITTED_ACTOR_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("emitted actor identity map lock poisoned");
+
+    if emitted_identities.get(&actor_address) == Some(&emitted) {
+        return Vec::new();
+    }
+
+    emitted_identities.insert(actor_address, emitted);
     vec![identity_event(identity, character_type, actor_index)]
 }
 
@@ -451,9 +513,10 @@ mod tests {
     use std::ffi::CString;
 
     use super::{
-        identity_events_for_actor, read_vbuffer, should_cache_identity, IdentityStore,
-        StoredPlayerIdentity, ACTOR_IDENTITY_SNAPSHOT_OFFSET, ACTOR_PLAYER_KEY_OFFSET,
-        DISPLAY_NAME_OFFSET, IS_ONLINE_OFFSET, PARTY_INDEX_OFFSET,
+        identity_events_for_actor, read_vbuffer, reset_battle_identity_state,
+        reset_emitted_identity_state, should_cache_identity, IdentityStore, StoredPlayerIdentity,
+        ACTOR_IDENTITY_SNAPSHOT_OFFSET, ACTOR_PLAYER_KEY_OFFSET, DISPLAY_NAME_OFFSET,
+        IS_ONLINE_OFFSET, PARTY_INDEX_OFFSET,
     };
 
     fn identity(name: &str, party_index: u8, is_online: bool) -> StoredPlayerIdentity {
@@ -566,6 +629,7 @@ mod tests {
 
     #[test]
     fn three_same_character_players_keep_direct_party_identity() {
+        reset_battle_identity_state();
         let character_type = 0x48ADDA36;
         let cases = [("Party 3", 3, 0), ("Party 1", 1, 1), ("Party 2", 2, 2)];
         let actors = cases
@@ -587,5 +651,29 @@ mod tests {
             assert_eq!(events[0].party_index, *expected_party);
             assert_eq!(events[0].display_name.to_str().unwrap(), *expected_name);
         }
+
+        reset_battle_identity_state();
+    }
+
+    #[test]
+    fn identity_is_emitted_once_per_actor_until_a_client_reconnects() {
+        reset_battle_identity_state();
+        let character_type = 0x48ADDA36;
+        let (actor, _snapshot) = actor_with_identity("Remote Player", 1);
+        let actor_ptr = actor.as_ptr().cast::<usize>();
+
+        assert_eq!(
+            identity_events_for_actor(actor_ptr, character_type, 7).len(),
+            1
+        );
+        assert!(identity_events_for_actor(actor_ptr, character_type, 7).is_empty());
+
+        reset_emitted_identity_state();
+        assert_eq!(
+            identity_events_for_actor(actor_ptr, character_type, 7).len(),
+            1
+        );
+
+        reset_battle_identity_state();
     }
 }

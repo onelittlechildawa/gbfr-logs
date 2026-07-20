@@ -5,9 +5,11 @@ import { AppShell, Burger, Group, NavLink, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { Gear, House } from "@phosphor-icons/react";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Toaster } from "react-hot-toast";
 import { Link, Outlet, useNavigate } from "react-router-dom";
+
+const MAX_DEBUG_CONSOLE_EVENTS = 500;
 
 const Layout = () => {
   const [mobileOpened, { toggle: toggleMobile }] = useDisclosure();
@@ -15,12 +17,24 @@ const Layout = () => {
   const { open_log_on_save } = useMeterSettingsStore((state) => ({ open_log_on_save: state.open_log_on_save }));
 
   const navigate = useNavigate();
+  const debugEventCount = useRef(0);
 
   useEffect(() => {
     const debugListener = listen("debug-event", (event: { payload: unknown }) => {
-      console.info(JSON.stringify(event.payload));
+      const eventIndex = debugEventCount.current++;
+      if (eventIndex < MAX_DEBUG_CONSOLE_EVENTS) {
+        console.info(JSON.stringify(event.payload));
+      } else if (eventIndex === MAX_DEBUG_CONSOLE_EVENTS) {
+        console.warn(`Debug event console limit reached (${MAX_DEBUG_CONSOLE_EVENTS}); further events are suppressed.`);
+      }
     });
 
+    return () => {
+      debugListener.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
     const saveListener = listen("encounter-saved", (event: { payload: number | null }) => {
       if (event.payload && open_log_on_save) {
         navigate(`/logs/${event.payload}`);
@@ -28,10 +42,9 @@ const Layout = () => {
     });
 
     return () => {
-      debugListener.then((f) => f());
       saveListener.then((f) => f());
     };
-  }, [open_log_on_save]);
+  }, [navigate, open_log_on_save]);
 
   return (
     <div className="log-window">

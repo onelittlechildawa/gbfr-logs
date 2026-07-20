@@ -14,7 +14,8 @@ export type SkillBreakdownProps = {
 const renderSkillRow = (
   characterType: CharacterType,
   skillData: ComputedSkillState | ComputedSkillGroup,
-  color: string
+  color: string,
+  showDamageDetails: boolean
 ) => {
   const isSkillGroup = typeof skillData.actionType === "object" && Object.hasOwn(skillData.actionType, "Group");
 
@@ -27,6 +28,7 @@ const renderSkillRow = (
         characterType={characterType}
         group={skillGroup}
         color={color}
+        showDamageDetails={showDamageDetails}
       />
     );
   } else {
@@ -38,6 +40,7 @@ const renderSkillRow = (
         characterType={characterType}
         skill={skill}
         color={color}
+        showDamageDetails={showDamageDetails}
       />
     );
   }
@@ -46,6 +49,11 @@ const renderSkillRow = (
 export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
   const { t } = useTranslation();
   const { skills } = useSkillBreakdown(player);
+  const showDamageDetails = skills.some(
+    (skill) =>
+      Boolean(skill.damageDetails) ||
+      ("skills" in skill && Boolean(skill.skills?.some((nestedSkill) => nestedSkill.damageDetails)))
+  );
 
   return (
     <tr className="skill-table">
@@ -60,11 +68,11 @@ export const SkillBreakdown = ({ player, color }: SkillBreakdownProps) => {
               <th className="header-column text-center">Max</th>
               <th className="header-column text-center">Avg</th>
               <th className="header-column text-center">%</th>
-              <th className="header-column text-center">{t("ui.damage-details.short")}</th>
+              {showDamageDetails && <th className="header-column text-center">{t("ui.damage-details.short")}</th>}
             </tr>
           </thead>
           <tbody className="transparent-bg">
-            {skills.map((skill) => renderSkillRow(player.characterType, skill, color))}
+            {skills.map((skill) => renderSkillRow(player.characterType, skill, color, showDamageDetails))}
           </tbody>
         </table>
       </td>

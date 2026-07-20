@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import { useMeterSettingsStore } from "../stores/useMeterSettingsStore";
@@ -5,7 +6,7 @@ import { ComputedPlayerState, EncounterState, MeterColumns, PlayerData, SortDire
 import { formatInPartyOrder, sortPlayers } from "../utils";
 import { PlayerRow } from "./PlayerRow";
 
-export const Table = ({
+const TableComponent = ({
   live = false,
   encounterState,
   partyData,
@@ -93,3 +94,7 @@ export const Table = ({
     </table>
   );
 };
+
+// The live timer updates the title bar every 500ms. Keep the much heavier
+// player/skill table untouched unless combat or party data actually changes.
+export const Table = memo(TableComponent);

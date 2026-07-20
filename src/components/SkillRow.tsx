@@ -11,9 +11,10 @@ export type SkillRowProps = {
   skill: ComputedSkillState;
   color: string;
   nested?: boolean;
+  showDamageDetails: boolean;
 };
 
-export const SkillRow = ({ characterType, skill, color, nested }: SkillRowProps) => {
+export const SkillRow = ({ characterType, skill, color, nested, showDamageDetails }: SkillRowProps) => {
   const { t } = useTranslation();
   const [detailsOpened, { open: openDetails, close: closeDetails }] = useDisclosure(false);
   const {
@@ -90,15 +91,22 @@ export const SkillRow = ({ characterType, skill, color, nested }: SkillRowProps)
           {skill.percentage.toFixed(0)}
           <span className="unit font-sm">%</span>
         </td>
-        <td className="text-center row-data">
-          {skill.damageDetails && (
-            <Tooltip label={t("ui.damage-details.open")}>
-              <Button size="compact-xs" variant="subtle" aria-label={t("ui.damage-details.open")} onClick={openDetails}>
-                {skill.damageDetails.effectiveMultiplier.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}×
-              </Button>
-            </Tooltip>
-          )}
-        </td>
+        {showDamageDetails && (
+          <td className="text-center row-data">
+            {skill.damageDetails && (
+              <Tooltip label={t("ui.damage-details.open")}>
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  aria-label={t("ui.damage-details.open")}
+                  onClick={openDetails}
+                >
+                  {skill.damageDetails.effectiveMultiplier.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}×
+                </Button>
+              </Tooltip>
+            )}
+          </td>
+        )}
         <div className="damage-bar" style={{ backgroundColor: color, width: `${skill.percentage}%` }} />
       </tr>
       {detailsOpened && (
