@@ -188,7 +188,7 @@ pub fn get_source_parent_instance(
         }
         // Wp1890: Cagliostro's Ouroboros Dragon Sled -> Pl1800
         0xC9F45042 => {
-            let parent_instance = parent_specified_instance_at(source, 0x578)?;
+            let parent_instance = parent_specified_instance_at(source, 0x558)?;
             Some((actor_type_id(parent_instance), parent_instance))
         }
         // Pl2000: Id's Dragon Form -> Pl1900
